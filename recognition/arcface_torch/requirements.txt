@@ -1,0 +1,30 @@
+# Core ML/AI frameworks
+torch==2.7.1
+torchvision==0.22.1
+
+# Computer vision and image processing
+opencv-python==4.12.0.88
+
+# Data science and analysis
+pandas==2.3.1
+scikit-learn==1.7.0
+matplotlib==3.10.3
+seaborn==0.13.2
+
+# Deep learning utilities
+tensorboard==2.19.0
+onnx==1.18.0
+
+# Face processing specific
+menpo==0.11.1
+mxnet==1.0.0
+
+# Evaluation and monitoring utilities
+psutil==7.0.0
+pynvml==12.0.0
+wandb==0.21.0
+
+# Utilities
+easydict==1.13
+tqdm==4.67.1
+prettytable==3.16.0
