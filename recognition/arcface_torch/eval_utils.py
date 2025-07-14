@@ -476,3 +476,20 @@ def log_results_to_wandb(results_dict, prefix=""):
         print(f"Logged {len(wandb_dict)} metrics to W&B")
     except Exception as e:
         print(f"Error logging to W&B: {e}")
+
+
+def log_progress_to_wandb(step, metrics_dict, prefix="progress"):
+    """Log time series data to W&B for chart visualization"""
+    if not WANDB_AVAILABLE:
+        return
+        
+    try:
+        # Prepare metrics with step information
+        wandb_dict = {"step": step}
+        for key, value in metrics_dict.items():
+            if isinstance(value, (int, float, bool)):
+                wandb_dict[f"{prefix}/{key}"] = value
+                
+        wandb.log(wandb_dict, step=step)
+    except Exception as e:
+        print(f"Error logging progress to W&B: {e}")

@@ -63,7 +63,7 @@ from backbones import get_model
 from eval_utils import (
     ComprehensiveMetrics, PerformanceMonitor, image2template_feature, verification,
     read_template_media_list, read_template_pair_list, save_results_to_csv, log_results_to_wandb,
-    load_ijbc_metadata_from_hf_dataset, load_hf_dataset_images
+    load_ijbc_metadata_from_hf_dataset, load_hf_dataset_images, log_progress_to_wandb
 )
 
 # Check for optional dependencies
@@ -303,7 +303,7 @@ def load_model(model_path, network, num_features=512, config=None):
         raise
 
 
-def extract_features(model, dataloader, use_flip_test=True, use_norm_score=True, use_detector_score=True, config=None):
+def extract_features(model, dataloader, use_flip_test=True, use_norm_score=True, use_detector_score=True, config=None, monitor=None, dataset=None, start_time=None):
     """
     Extract features from all images following ArcFace protocol with optional optimizations
     """
@@ -378,7 +378,38 @@ def extract_features(model, dataloader, use_flip_test=True, use_norm_score=True,
                 # Log progress periodically
                 if batch_idx % log_interval == 0:
                     logger.info(f"Processed {batch_idx * dataloader.batch_size} images")
-                
+                    
+                    # Log progress to W&B for chart visualization
+                    if WANDB_AVAILABLE and wandb.run is not None and start_time is not None:
+                        current_images = batch_idx * dataloader.batch_size
+                        current_time = time.time() - start_time
+                        current_fps = current_images / current_time if current_time > 0 else 0
+                        
+                        # Get current memory usage if monitor is available
+                        memory_stats = {}
+                        if monitor is not None:
+                            memory_stats = monitor.get_current_memory_usage()
+                        
+                        progress_metrics = {
+                            'images_processed': current_images,
+                            'current_fps': current_fps,
+                            'elapsed_time_seconds': current_time,
+                            'batch_idx': batch_idx,
+                        }
+                        
+                        # Add progress percentage if dataset is available
+                        if dataset is not None:
+                            progress_metrics['progress_percent'] = (current_images / len(dataset)) * 100
+                        
+                        # Add memory metrics if available
+                        if memory_stats:
+                            progress_metrics.update({
+                                'current_ram_mb': memory_stats.get('ram_mb', 0),
+                                'current_gpu_mb': memory_stats.get('gpu_mb', 0),
+                                'current_cpu_percent': memory_stats.get('cpu_percent', 0),
+                            })
+                        
+                        log_progress_to_wandb(batch_idx, progress_metrics)
                 # Clear cache periodically for memory efficiency
                 if batch_idx % clear_cache_interval == 0:
                     torch.cuda.empty_cache()
@@ -410,9 +441,12 @@ def setup_wandb(args, config=None):
     if config and CONFIG_SYSTEM_AVAILABLE:
         wandb_config = config.wandb
         project = wandb_config.get('project') or args.wandb_project
-        # Prioritize environment variable over config null values
-        entity = args.wandb_entity or wandb_config.get('entity')
+        # Prioritize environment variable over config values
+        entity = args.wandb_entity if args.wandb_entity else wandb_config.get('entity')
         tags = wandb_config.get('tags', [])
+        
+        # Debug logging for entity selection
+        logger.info(f"W&B entity selection - args.wandb_entity: '{args.wandb_entity}', config.entity: '{wandb_config.get('entity')}', selected: '{entity}'")
     else:
         project = args.wandb_project
         entity = args.wandb_entity
@@ -749,11 +783,14 @@ def main():
         # Extract features
         eval_start_time = time.time()
         img_feats, faceness_scores = extract_features(
-            model, dataloader, 
+            model, dataloader,
             use_flip_test=args.use_flip_test,
             use_norm_score=args.use_norm_score,
             use_detector_score=args.use_detector_score,
-            config=config
+            config=config,
+            monitor=monitor,
+            dataset=dataset,
+            start_time=eval_start_time
         )
         
         feature_extraction_time = time.time() - eval_start_time
@@ -833,8 +870,8 @@ def main():
             'feature_extraction_time_seconds': feature_extraction_time,
         }
         
-        # Save results to CSV
-        result_file = os.path.join(args.result_dir, f'{args.job}_{args.target.lower()}_results.csv')
+        # Save results to CSV with timestamp
+        result_file = os.path.join(args.result_dir, f'{args.job}_{args.target.lower()}_results_{timestamp}.csv')
         save_results_to_csv(comprehensive_results, result_file)
         
         # Log to W&B
