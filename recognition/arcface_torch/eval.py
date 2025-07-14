@@ -4,11 +4,15 @@ Comprehensive ArcFace Evaluation on IJB-C Dataset
 A production-ready evaluation framework that combines the best of ArcFace and CVLface approaches.
 
 Usage:
-    python eval_arcface_full.py --model-path ./pretrained_models/ms1mv3_arcface_r100_fp16/backbone.pth \
-                                --network r100 \
-                                --image-path /path/to/IJBC_gt_aligned \
-                                --result-dir ./eval_results \
-                                --wandb-project arcface-ijbc-eval
+    # With environment variables configured:
+    python eval.py --model-path ms1mv3_arcface_r100_fp16/backbone.pth --network r100
+    
+    # Or with explicit paths:
+    python eval.py --model-path ./pretrained_models/ms1mv3_arcface_r100_fp16/backbone.pth \
+                   --network r100 \
+                   --image-path /path/to/IJBC_gt_aligned \
+                   --result-dir ./eval_results \
+                   --wandb-project arcface-ijbc-eval
 """
 
 import os
@@ -27,11 +31,19 @@ from torch.utils.data import Dataset, DataLoader
 from skimage import transform as trans
 from tqdm import tqdm
 
+# Load environment variables
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv is optional
+
 # Import local modules
 from backbones import get_model
 from eval_utils import (
     ComprehensiveMetrics, PerformanceMonitor, image2template_feature, verification,
-    read_template_media_list, read_template_pair_list, save_results_to_csv, log_results_to_wandb
+    read_template_media_list, read_template_pair_list, save_results_to_csv, log_results_to_wandb,
+    load_ijbc_metadata_from_hf_dataset, load_hf_dataset_images
 )
 
 # Check for optional dependencies
@@ -52,7 +64,7 @@ logger.info(f"Using device: {device}")
 
 
 class IJBCDataset(Dataset):
-    """Dataset for pre-aligned IJB-C images"""
+    """Dataset for pre-aligned IJB-C images (traditional format)"""
     
     def __init__(self, image_path, files_list, transform=None):
         self.image_path = image_path
@@ -127,6 +139,65 @@ class IJBCDataset(Dataset):
                 'images': dummy_img,
                 'faceness_score': 0.0,
                 'img_name': line[0] if len(line) > 0 else 'error'
+            }
+
+
+class HFIJBCDataset(Dataset):
+    """Dataset for pre-aligned IJB-C images in HuggingFace format"""
+    
+    def __init__(self, hf_dataset, faceness_scores):
+        self.hf_dataset = hf_dataset
+        self.faceness_scores = faceness_scores
+        
+    def __len__(self):
+        return len(self.hf_dataset)
+    
+    def __getitem__(self, idx):
+        """
+        Get preprocessed image from HuggingFace dataset
+        Returns both original and flipped versions for test-time augmentation
+        """
+        try:
+            # Get image from HuggingFace dataset
+            item = self.hf_dataset[idx]
+            img = item['image']
+            
+            # Convert PIL image to numpy array
+            if hasattr(img, 'convert'):
+                img = img.convert('RGB')
+                img = np.array(img)
+            
+            # Ensure image is 112x112 (should already be pre-aligned)
+            if img.shape[:2] != (112, 112):
+                img = cv2.resize(img, (112, 112))
+            
+            # Create flipped version for TTA
+            flipped_img = np.fliplr(img)
+            
+            # Transpose to CHW format (RGB)
+            aligned_img = np.transpose(img, (2, 0, 1))  # 3x112x112, RGB
+            flipped_img = np.transpose(flipped_img, (2, 0, 1))
+            
+            # Stack original and flipped
+            input_blob = np.stack([aligned_img, flipped_img], axis=0)  # 2x3x112x112
+            
+            # Get faceness score
+            faceness_score = float(self.faceness_scores[idx])
+            
+            return {
+                'images': input_blob.astype(np.float32),
+                'faceness_score': faceness_score,
+                'img_name': f'image_{idx:06d}'
+            }
+            
+        except Exception as e:
+            logger.warning(f"Error processing image {idx}: {e}")
+            # Return dummy data in case of error
+            dummy_img = np.zeros((2, 3, 112, 112), dtype=np.float32)
+            return {
+                'images': dummy_img,
+                'faceness_score': 0.0,
+                'img_name': f'error_{idx:06d}'
             }
 
 
@@ -238,13 +309,24 @@ def setup_wandb(args):
         logger.warning("W&B not available, skipping initialization")
         return False
     
+    # Skip W&B if no project specified
+    if not args.wandb_project:
+        logger.info("No W&B project specified, skipping W&B logging")
+        return False
+    
     try:
+        # Set W&B token from environment if available
+        wandb_token = os.getenv('WANDB_TOKEN')
+        if wandb_token:
+            os.environ['WANDB_API_KEY'] = wandb_token
+        
         run_name = f"{args.network}_{Path(args.model_path).stem}_{args.target}"
         
-        wandb.init(
-            project=args.wandb_project,
-            name=run_name,
-            config={
+        # Initialize W&B with environment-based configuration
+        init_kwargs = {
+            'project': args.wandb_project,
+            'name': run_name,
+            'config': {
                 'model_path': args.model_path,
                 'network': args.network,
                 'target': args.target,
@@ -253,8 +335,14 @@ def setup_wandb(args):
                 'use_norm_score': args.use_norm_score,
                 'use_detector_score': args.use_detector_score,
             },
-            tags=[args.network, args.target, "comprehensive", "face-recognition"]
-        )
+            'tags': [args.network, args.target, "comprehensive", "face-recognition"]
+        }
+        
+        # Add entity if specified
+        if args.wandb_entity:
+            init_kwargs['entity'] = args.wandb_entity
+        
+        wandb.init(**init_kwargs)
         logger.info(f"W&B initialized: {run_name}")
         return True
     except Exception as e:
@@ -266,12 +354,16 @@ def main():
     parser = argparse.ArgumentParser(description='Comprehensive ArcFace Evaluation on IJB-C')
     
     # Model arguments
-    parser.add_argument('--model-path', required=True, help='Path to model checkpoint (backbone.pth)')
+    parser.add_argument('--model-path',
+                       default=None,
+                       help='Path to model checkpoint (backbone.pth). Can be relative to MODEL_ROOT env var.')
     parser.add_argument('--network', default='r100', help='Model architecture (r18, r34, r50, r100, etc.)')
     parser.add_argument('--num-features', type=int, default=512, help='Feature dimension')
     
     # Data arguments
-    parser.add_argument('--image-path', required=True, help='Path to IJB-C dataset directory')
+    parser.add_argument('--image-path',
+                       default=os.getenv('IJBC_DATASET_PATH'),
+                       help='Path to IJB-C dataset directory (default: IJBC_DATASET_PATH env var)')
     parser.add_argument('--target', default='IJBC', choices=['IJBC', 'IJBB'], help='Target dataset')
     
     # Evaluation arguments
@@ -282,14 +374,40 @@ def main():
     parser.add_argument('--use-detector-score', action='store_true', default=True, help='Use detector score (TestMode D1)')
     
     # Output arguments
-    parser.add_argument('--result-dir', default='./eval_results', help='Directory to save results')
+    parser.add_argument('--result-dir',
+                       default=os.getenv('RESULT_DIR', './eval_results'),
+                       help='Directory to save results (default: RESULT_DIR env var or ./eval_results)')
     parser.add_argument('--job', default='arcface_comprehensive', help='Job name for output files')
     
     # Logging arguments
-    parser.add_argument('--wandb-project', default='arcface-ijbc-comprehensive', help='W&B project name')
-    parser.add_argument('--wandb-entity', default=None, help='W&B entity name')
+    parser.add_argument('--wandb-project',
+                       default=os.getenv('WANDB_PROJECT', 'arcface-ijbc-comprehensive'),
+                       help='W&B project name (default: WANDB_PROJECT env var)')
+    parser.add_argument('--wandb-entity',
+                       default=os.getenv('WANDB_TEAM'),
+                       help='W&B entity name (default: WANDB_TEAM env var)')
     
     args = parser.parse_args()
+    
+    # Handle model path with MODEL_ROOT support
+    if args.model_path is None:
+        parser.error("--model-path is required")
+    
+    # If model path is relative and MODEL_ROOT is set, make it relative to MODEL_ROOT
+    if not os.path.isabs(args.model_path):
+        model_root = os.getenv('MODEL_ROOT')
+        if model_root:
+            args.model_path = os.path.join(model_root, args.model_path)
+    
+    # Validate required paths
+    if args.image_path is None:
+        parser.error("--image-path is required (or set IJBC_DATASET_PATH environment variable)")
+    
+    if not os.path.exists(args.image_path):
+        parser.error(f"Dataset path does not exist: {args.image_path}")
+    
+    if not os.path.exists(args.model_path):
+        parser.error(f"Model path does not exist: {args.model_path}")
     
     # Create result directory
     os.makedirs(args.result_dir, exist_ok=True)
@@ -323,31 +441,54 @@ def main():
         # Load model
         model = load_model(args.model_path, args.network, args.num_features)
         
-        # Load IJB-C metadata
+        # Load IJB-C metadata - detect format (HuggingFace vs traditional)
         logger.info("Loading IJB-C metadata...")
+        metadata_path = os.path.join(args.image_path, 'metadata.pt')
         meta_dir = os.path.join(args.image_path, 'meta')
         
-        # Load template-media relationships
-        templates, medias = read_template_media_list(
-            os.path.join(meta_dir, f'{args.target.lower()}_face_tid_mid.txt'))
-        
-        # Load template pairs for verification
-        p1, p2, label = read_template_pair_list(
-            os.path.join(meta_dir, f'{args.target.lower()}_template_pair_label.txt'))
+        if os.path.exists(metadata_path):
+            # HuggingFace dataset format
+            logger.info("Detected HuggingFace dataset format")
+            
+            # Load metadata from HuggingFace format
+            templates, medias, p1, p2, label, faceness_scores = load_ijbc_metadata_from_hf_dataset(args.image_path)
+            
+            # Load HuggingFace dataset
+            hf_dataset = load_hf_dataset_images(args.image_path)
+            
+            # Create HuggingFace dataset
+            dataset = HFIJBCDataset(hf_dataset, faceness_scores)
+            
+        elif os.path.exists(meta_dir):
+            # Traditional IJB-C format
+            logger.info("Detected traditional IJB-C dataset format")
+            
+            # Load template-media relationships
+            templates, medias = read_template_media_list(
+                os.path.join(meta_dir, f'{args.target.lower()}_face_tid_mid.txt'))
+            
+            # Load template pairs for verification
+            p1, p2, label = read_template_pair_list(
+                os.path.join(meta_dir, f'{args.target.lower()}_template_pair_label.txt'))
+            
+            # Load image list
+            img_list_path = os.path.join(meta_dir, f'{args.target.lower()}_name_5pts_score.txt')
+            with open(img_list_path, 'r') as f:
+                files_list = f.readlines()
+            
+            # Create traditional dataset
+            dataset = IJBCDataset(
+                image_path=os.path.join(args.image_path, 'loose_crop'),
+                files_list=files_list
+            )
+        else:
+            raise FileNotFoundError(
+                f"No valid IJB-C dataset found at {args.image_path}. "
+                f"Expected either metadata.pt (HuggingFace format) or meta/ directory (traditional format)"
+            )
         
         logger.info(f"Loaded {len(templates)} images, {len(np.unique(templates))} templates")
         logger.info(f"Loaded {len(p1)} verification pairs")
-        
-        # Load image list
-        img_list_path = os.path.join(meta_dir, f'{args.target.lower()}_name_5pts_score.txt')
-        with open(img_list_path, 'r') as f:
-            files_list = f.readlines()
-        
-        # Create dataset and dataloader
-        dataset = IJBCDataset(
-            image_path=os.path.join(args.image_path, 'loose_crop'),
-            files_list=files_list
-        )
         
         dataloader = DataLoader(
             dataset,

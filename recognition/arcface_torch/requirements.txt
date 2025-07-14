@@ -18,6 +18,10 @@ onnx==1.18.0
 # Face processing specific
 menpo==0.11.1
 mxnet==1.0.0
+scikit-image==0.25.2
+
+# Dataset handling
+datasets>=2.0.0
 
 # Evaluation and monitoring utilities
 psutil==7.0.0
@@ -28,3 +32,4 @@ wandb==0.21.0
 easydict==1.13
 tqdm==4.67.1
 prettytable==3.16.0
+python-dotenv==1.0.1

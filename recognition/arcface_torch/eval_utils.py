@@ -374,6 +374,78 @@ def read_template_pair_list(path):
     return t1, t2, label
 
 
+def load_ijbc_metadata_from_hf_dataset(dataset_path):
+    """
+    Load IJB-C metadata from HuggingFace dataset format.
+    
+    Args:
+        dataset_path: Path to the dataset containing metadata.pt
+        
+    Returns:
+        tuple: (templates, medias, p1, p2, label, faceness_scores)
+    """
+    metadata_path = os.path.join(dataset_path, 'metadata.pt')
+    
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+    
+    try:
+        metadata = torch.load(metadata_path, weights_only=False)
+        
+        # Extract arrays from metadata
+        templates = metadata['templates']
+        medias = metadata['medias']
+        p1 = metadata['p1']
+        p2 = metadata['p2']
+        label = metadata['label']
+        faceness_scores = metadata['faceness_scores']
+        
+        # Convert to numpy arrays if they're torch tensors
+        if isinstance(templates, torch.Tensor):
+            templates = templates.numpy()
+        if isinstance(medias, torch.Tensor):
+            medias = medias.numpy()
+        if isinstance(p1, torch.Tensor):
+            p1 = p1.numpy()
+        if isinstance(p2, torch.Tensor):
+            p2 = p2.numpy()
+        if isinstance(label, torch.Tensor):
+            label = label.numpy()
+        if isinstance(faceness_scores, torch.Tensor):
+            faceness_scores = faceness_scores.numpy()
+            
+        print(f"Loaded IJB-C metadata:")
+        print(f"  - Images: {len(templates)}")
+        print(f"  - Templates: {len(np.unique(templates))}")
+        print(f"  - Verification pairs: {len(p1)}")
+        
+        return templates, medias, p1, p2, label, faceness_scores
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to load metadata from {metadata_path}: {e}")
+
+
+def load_hf_dataset_images(dataset_path):
+    """
+    Load images from HuggingFace dataset format.
+    
+    Args:
+        dataset_path: Path to the HuggingFace dataset
+        
+    Returns:
+        dataset: HuggingFace dataset object
+    """
+    try:
+        from datasets import load_from_disk
+        dataset = load_from_disk(dataset_path)
+        print(f"Loaded HuggingFace dataset with {len(dataset)} images")
+        return dataset
+    except ImportError:
+        raise ImportError("datasets library not found. Install with: pip install datasets")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load HuggingFace dataset from {dataset_path}: {e}")
+
+
 def save_results_to_csv(results_dict, output_path):
     """Save evaluation results to CSV file"""
     try:
