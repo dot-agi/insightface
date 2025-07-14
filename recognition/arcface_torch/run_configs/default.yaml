@@ -1,0 +1,50 @@
+# Default Configuration for ArcFace Evaluation
+# Balanced settings for most GPU types
+
+# Model Configuration
+model:
+  network: "r100"
+  num_features: 512
+  fp16: false
+  
+# Data Configuration  
+data:
+  target: "IJBC"
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: false
+  
+# Evaluation Configuration
+evaluation:
+  use_flip_test: true
+  use_norm_score: true  
+  use_detector_score: true
+  compile_model: false
+  channels_last: false
+  
+# Performance Optimization
+performance:
+  mixed_precision: false
+  compile_mode: "default"
+  enable_graph_mode: false
+  matmul_precision: "default"
+  cuda_memory_fraction: 0.8
+  
+# Monitoring Configuration
+monitoring:
+  memory_monitor_interval: 1.0
+  log_interval: 100
+  
+# Output Configuration
+output:
+  result_dir: "./eval_results"
+  job: "arcface_evaluation"
+  save_features: false
+  
+# W&B Configuration
+wandb:
+  project: "arcface-benchmark"
+  entity: null
+  tags: ["default"]

@@ -1,0 +1,50 @@
+# NVIDIA A100 Optimized Configuration for ArcFace Evaluation
+# Designed for maximum throughput and efficiency on A100 GPUs
+
+# Model Configuration
+model:
+  network: "r100"  # Model architecture
+  num_features: 512
+  fp16: true  # Enable mixed precision for A100
+  
+# Data Configuration  
+data:
+  target: "IJBC"
+  batch_size: 256  # Optimized for A100 memory (40GB/80GB)
+  num_workers: 16  # A100 systems typically have high CPU core count
+  pin_memory: true
+  prefetch_factor: 4  # Improve data loading efficiency
+  persistent_workers: true  # Keep workers alive between epochs
+  
+# Evaluation Configuration
+evaluation:
+  use_flip_test: true
+  use_norm_score: true  
+  use_detector_score: true
+  compile_model: true  # Use torch.compile for A100 optimization
+  channels_last: true  # Memory format optimization for A100
+  
+# Performance Optimization
+performance:
+  mixed_precision: true
+  compile_mode: "max-autotune"  # Aggressive optimization for A100
+  enable_graph_mode: true
+  matmul_precision: "high"  # A100 supports high precision matmul
+  cuda_memory_fraction: 0.95  # Use most of A100 memory
+  
+# Monitoring Configuration
+monitoring:
+  memory_monitor_interval: 2.0  # Seconds between memory checks
+  log_interval: 50  # Log every N batches
+  
+# Output Configuration
+output:
+  result_dir: "./eval_results"
+  job: "arcface_a100"
+  save_features: false  # Don't save features to disk to save I/O
+  
+# W&B Configuration
+wandb:
+  project: "arcface-a100-benchmark"
+  entity: null  # Set via environment variable
+  tags: ["a100", "optimized", "production"]

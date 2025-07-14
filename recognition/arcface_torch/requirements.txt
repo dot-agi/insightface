@@ -33,3 +33,4 @@ easydict==1.13
 tqdm==4.67.1
 prettytable==3.16.0
 python-dotenv==1.0.1
+PyYAML>=6.0

@@ -3,11 +3,22 @@
 Comprehensive ArcFace Evaluation on IJB-C Dataset
 A production-ready evaluation framework that combines the best of ArcFace and CVLface approaches.
 
+Features:
+- YAML configuration system for easy customization
+- A100 optimizations (mixed precision, torch.compile, channels_last memory format)
+- Automatic hardware detection and optimization
+- Backward compatibility with CLI arguments
+- HuggingFace and traditional dataset format support
+
 Usage:
-    # With environment variables configured:
-    python eval.py --model-path ms1mv3_arcface_r100_fp16/backbone.pth --network r100
+    # With YAML configuration (recommended):
+    python eval.py --config a100 --model-path ./models/backbone.pth
     
-    # Or with explicit paths:
+    # With config overrides:
+    python eval.py --config default --model-path ./models/backbone.pth \
+                   --override data.batch_size=512 performance.mixed_precision=true
+    
+    # Legacy CLI usage (backward compatible):
     python eval.py --model-path ./pretrained_models/ms1mv3_arcface_r100_fp16/backbone.pth \
                    --network r100 \
                    --image-path /path/to/IJBC_gt_aligned \
@@ -22,6 +33,7 @@ import time
 import logging
 from datetime import datetime
 from pathlib import Path
+import gc
 import cv2
 import numpy as np
 import pandas as pd
@@ -37,6 +49,14 @@ try:
     load_dotenv()
 except ImportError:
     pass  # dotenv is optional
+
+# Import config system
+try:
+    from config_loader import load_config, EvaluationConfig
+    CONFIG_SYSTEM_AVAILABLE = True
+except ImportError:
+    CONFIG_SYSTEM_AVAILABLE = False
+    EvaluationConfig = None
 
 # Import local modules
 from backbones import get_model
@@ -61,6 +81,23 @@ logger = logging.getLogger(__name__)
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logger.info(f"Using device: {device}")
+
+# A100 specific optimizations
+if torch.cuda.is_available():
+    # Set memory format to channels last for better A100 performance
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for A100
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Enable memory efficient attention if available
+    try:
+        torch.backends.cuda.enable_flash_sdp(True)
+    except:
+        pass
+    
+    # Check if A100 is available
+    if torch.cuda.get_device_name().startswith('NVIDIA A100'):
+        logger.info("🚀 A100 GPU detected - enabling advanced optimizations")
 
 
 class IJBCDataset(Dataset):
@@ -143,18 +180,19 @@ class IJBCDataset(Dataset):
 
 
 class HFIJBCDataset(Dataset):
-    """Dataset for pre-aligned IJB-C images in HuggingFace format"""
+    """Dataset for pre-aligned IJB-C images in HuggingFace format with A100 optimizations"""
     
-    def __init__(self, hf_dataset, faceness_scores):
+    def __init__(self, hf_dataset, faceness_scores, channels_last=False):
         self.hf_dataset = hf_dataset
         self.faceness_scores = faceness_scores
+        self.channels_last = channels_last
         
     def __len__(self):
         return len(self.hf_dataset)
     
     def __getitem__(self, idx):
         """
-        Get preprocessed image from HuggingFace dataset
+        Get preprocessed image from HuggingFace dataset with optimizations
         Returns both original and flipped versions for test-time augmentation
         """
         try:
@@ -165,7 +203,9 @@ class HFIJBCDataset(Dataset):
             # Convert PIL image to numpy array
             if hasattr(img, 'convert'):
                 img = img.convert('RGB')
-                img = np.array(img)
+                img = np.array(img, dtype=np.float32)
+            else:
+                img = np.array(img, dtype=np.float32)
             
             # Ensure image is 112x112 (should already be pre-aligned)
             if img.shape[:2] != (112, 112):
@@ -181,11 +221,16 @@ class HFIJBCDataset(Dataset):
             # Stack original and flipped
             input_blob = np.stack([aligned_img, flipped_img], axis=0)  # 2x3x112x112
             
+            # Convert to tensor and set memory format if requested
+            input_tensor = torch.from_numpy(input_blob)
+            if self.channels_last:
+                input_tensor = input_tensor.to(memory_format=torch.channels_last)
+            
             # Get faceness score
             faceness_score = float(self.faceness_scores[idx])
             
             return {
-                'images': input_blob.astype(np.float32),
+                'images': input_tensor,
                 'faceness_score': faceness_score,
                 'img_name': f'image_{idx:06d}'
             }
@@ -193,7 +238,9 @@ class HFIJBCDataset(Dataset):
         except Exception as e:
             logger.warning(f"Error processing image {idx}: {e}")
             # Return dummy data in case of error
-            dummy_img = np.zeros((2, 3, 112, 112), dtype=np.float32)
+            dummy_img = torch.zeros((2, 3, 112, 112), dtype=torch.float32)
+            if self.channels_last:
+                dummy_img = dummy_img.to(memory_format=torch.channels_last)
             return {
                 'images': dummy_img,
                 'faceness_score': 0.0,
@@ -201,13 +248,25 @@ class HFIJBCDataset(Dataset):
             }
 
 
-def load_model(model_path, network, num_features=512):
-    """Load ArcFace model from checkpoint"""
+def load_model(model_path, network, num_features=512, config=None):
+    """Load ArcFace model from checkpoint with optional optimizations"""
     logger.info(f"Loading model: {network} from {model_path}")
     
     try:
+        # Determine optimization settings
+        if config and CONFIG_SYSTEM_AVAILABLE:
+            fp16 = config.get('model.fp16', False)
+            channels_last = config.get('evaluation.channels_last', False)
+            compile_model = config.get('evaluation.compile_model', False)
+            compile_mode = config.get('performance.compile_mode', 'default')
+        else:
+            fp16 = False
+            channels_last = False
+            compile_model = False
+            compile_mode = 'default'
+        
         # Load model architecture
-        model = get_model(network, dropout=0, fp16=False, num_features=num_features)
+        model = get_model(network, dropout=0, fp16=fp16, num_features=num_features)
         
         # Load weights
         if os.path.exists(model_path):
@@ -219,12 +278,23 @@ def load_model(model_path, network, num_features=512):
         
         # Move to device and set eval mode
         model = model.to(device)
+        
+        # Set memory format for A100 optimization
+        if channels_last:
+            model = model.to(memory_format=torch.channels_last)
+            logger.info("Model converted to channels_last format")
+        
         model.eval()
         
         # Use DataParallel if multiple GPUs available
         if torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
             logger.info(f"Using DataParallel with {torch.cuda.device_count()} GPUs")
+        
+        # Compile model for optimization
+        if compile_model:
+            logger.info(f"Compiling model with mode: {compile_mode}")
+            model = torch.compile(model, mode=compile_mode)
         
         return model
         
@@ -233,14 +303,28 @@ def load_model(model_path, network, num_features=512):
         raise
 
 
-def extract_features(model, dataloader, use_flip_test=True, use_norm_score=True, use_detector_score=True):
+def extract_features(model, dataloader, use_flip_test=True, use_norm_score=True, use_detector_score=True, config=None):
     """
-    Extract features from all images following ArcFace protocol
+    Extract features from all images following ArcFace protocol with optional optimizations
     """
     logger.info("Starting feature extraction...")
     
     img_feats = []
     faceness_scores = []
+    
+    # Mixed precision setup
+    if config and CONFIG_SYSTEM_AVAILABLE:
+        use_amp = config.get('performance.mixed_precision', False)
+        channels_last = config.get('evaluation.channels_last', False)
+        log_interval = config.get('monitoring.log_interval', 100)
+        clear_cache_interval = config.get('performance.clear_cache_interval', 50)
+    else:
+        use_amp = False
+        channels_last = False
+        log_interval = 100
+        clear_cache_interval = 50
+    
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
     
     model.eval()
     with torch.no_grad():
@@ -253,13 +337,22 @@ def extract_features(model, dataloader, use_flip_test=True, use_norm_score=True,
                 
                 # Reshape to [batch_size*2, 3, 112, 112] for processing both original and flipped
                 images = images.view(-1, 3, 112, 112)
-                images = images.to(device)
+                images = images.to(device, non_blocking=True)
                 
-                # Normalize images: [0,255] -> [-1,1]
-                images = images.div(255.0).sub(0.5).div(0.5)
+                # Set memory format if enabled
+                if channels_last:
+                    images = images.to(memory_format=torch.channels_last)
                 
-                # Forward pass
-                features = model(images)  # [batch_size*2, feature_dim]
+                # Mixed precision forward pass
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        # Normalize images: [0,255] -> [-1,1]
+                        images = images.div(255.0).sub(0.5).div(0.5)
+                        features = model(images)  # [batch_size*2, feature_dim]
+                else:
+                    # Normalize images: [0,255] -> [-1,1]
+                    images = images.div(255.0).sub(0.5).div(0.5)
+                    features = model(images)  # [batch_size*2, feature_dim]
                 
                 # Reshape back to [batch_size, 2, feature_dim]
                 features = features.view(batch_size, 2, -1)
@@ -283,8 +376,12 @@ def extract_features(model, dataloader, use_flip_test=True, use_norm_score=True,
                 faceness_scores.extend(faceness.numpy())
                 
                 # Log progress periodically
-                if batch_idx % 100 == 0:
+                if batch_idx % log_interval == 0:
                     logger.info(f"Processed {batch_idx * dataloader.batch_size} images")
+                
+                # Clear cache periodically for memory efficiency
+                if batch_idx % clear_cache_interval == 0:
+                    torch.cuda.empty_cache()
                     
             except Exception as e:
                 logger.warning(f"Error in batch {batch_idx}: {e}")
@@ -303,14 +400,26 @@ def extract_features(model, dataloader, use_flip_test=True, use_norm_score=True,
     return img_feats, faceness_scores
 
 
-def setup_wandb(args):
-    """Initialize Weights & Biases logging"""
+def setup_wandb(args, config=None):
+    """Initialize Weights & Biases logging with config support"""
     if not WANDB_AVAILABLE:
         logger.warning("W&B not available, skipping initialization")
         return False
     
+    # Determine W&B settings
+    if config and CONFIG_SYSTEM_AVAILABLE:
+        wandb_config = config.wandb
+        project = wandb_config.get('project') or args.wandb_project
+        # Prioritize environment variable over config null values
+        entity = args.wandb_entity or wandb_config.get('entity')
+        tags = wandb_config.get('tags', [])
+    else:
+        project = args.wandb_project
+        entity = args.wandb_entity
+        tags = []
+    
     # Skip W&B if no project specified
-    if not args.wandb_project:
+    if not project:
         logger.info("No W&B project specified, skipping W&B logging")
         return False
     
@@ -320,27 +429,41 @@ def setup_wandb(args):
         if wandb_token:
             os.environ['WANDB_API_KEY'] = wandb_token
         
-        run_name = f"{args.network}_{Path(args.model_path).stem}_{args.target}"
+        # Create run name
+        if config:
+            network = config.get('model.network', args.network)
+            target = config.get('data.target', args.target)
+            optimization = "A100" if config.get('performance.mixed_precision') else "Standard"
+            run_name = f"{network}_{Path(args.model_path).stem}_{target}_{optimization}"
+        else:
+            run_name = f"{args.network}_{Path(args.model_path).stem}_{args.target}"
+        
+        # Prepare config data
+        run_config = {
+            'model_path': args.model_path,
+            'network': args.network,
+            'target': args.target,
+            'batch_size': args.batch_size,
+            'use_flip_test': args.use_flip_test,
+            'use_norm_score': args.use_norm_score,
+            'use_detector_score': args.use_detector_score,
+        }
+        
+        # Add full config if available
+        if config:
+            run_config.update(config.raw)
         
         # Initialize W&B with environment-based configuration
         init_kwargs = {
-            'project': args.wandb_project,
+            'project': project,
             'name': run_name,
-            'config': {
-                'model_path': args.model_path,
-                'network': args.network,
-                'target': args.target,
-                'batch_size': args.batch_size,
-                'use_flip_test': args.use_flip_test,
-                'use_norm_score': args.use_norm_score,
-                'use_detector_score': args.use_detector_score,
-            },
-            'tags': [args.network, args.target, "comprehensive", "face-recognition"]
+            'config': run_config,
+            'tags': tags + [args.network, args.target, "comprehensive", "face-recognition"]
         }
         
         # Add entity if specified
-        if args.wandb_entity:
-            init_kwargs['entity'] = args.wandb_entity
+        if entity:
+            init_kwargs['entity'] = entity
         
         wandb.init(**init_kwargs)
         logger.info(f"W&B initialized: {run_name}")
@@ -350,8 +473,62 @@ def setup_wandb(args):
         return False
 
 
+def optimize_gpu_settings(config):
+    """Apply GPU optimizations based on configuration"""
+    if not torch.cuda.is_available():
+        return
+        
+    # Set memory fraction
+    memory_fraction = config.get('performance.cuda_memory_fraction', 0.9)
+    torch.cuda.set_per_process_memory_fraction(memory_fraction)
+    
+    # Set matmul precision
+    matmul_precision = config.get('performance.matmul_precision', 'high')
+    if matmul_precision == 'high':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    
+    logger.info(f"Applied GPU optimizations: memory_fraction={memory_fraction}, matmul_precision={matmul_precision}")
+
+
+def detect_and_apply_a100_optimizations(config):
+    """Detect A100 GPU and apply optimizations automatically"""
+    if not torch.cuda.is_available():
+        return config
+        
+    # Check if A100 is available
+    if torch.cuda.get_device_name().startswith('NVIDIA A100'):
+        logger.info("🚀 A100 GPU detected - applying automatic optimizations")
+        
+        # Apply A100 optimizations if not already configured
+        if not config.get('performance.mixed_precision'):
+            config.set('performance.mixed_precision', True)
+            logger.info("Enabled mixed precision for A100")
+        
+        if not config.get('evaluation.channels_last'):
+            config.set('evaluation.channels_last', True)
+            logger.info("Enabled channels_last memory format for A100")
+        
+        if not config.get('evaluation.compile_model'):
+            config.set('evaluation.compile_model', True)
+            logger.info("Enabled model compilation for A100")
+        
+        # Increase batch size if not set
+        if config.get('data.batch_size', 64) < 128:
+            config.set('data.batch_size', 256)
+            logger.info("Increased batch size to 256 for A100")
+    
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser(description='Comprehensive ArcFace Evaluation on IJB-C')
+    
+    # Config arguments (new system)
+    parser.add_argument('--config',
+                       help='Configuration name (from run_configs/) - enables YAML config system')
+    parser.add_argument('--override', action='append', default=[],
+                       help='Config overrides in key=value format (e.g., data.batch_size=512)')
     
     # Model arguments
     parser.add_argument('--model-path',
@@ -389,6 +566,58 @@ def main():
     
     args = parser.parse_args()
     
+    # Load configuration if specified
+    config = None
+    if args.config and CONFIG_SYSTEM_AVAILABLE:
+        # Parse overrides
+        overrides = {}
+        for override in args.override:
+            if '=' not in override:
+                continue
+            key, value = override.split('=', 1)
+            # Try to convert to appropriate type
+            try:
+                value = int(value)
+            except ValueError:
+                try:
+                    value = float(value)
+                except ValueError:
+                    if value.lower() in ('true', 'false'):
+                        value = value.lower() == 'true'
+            overrides[key] = value
+        
+        # Load configuration
+        try:
+            config = load_config(args.config, **overrides)
+            logger.info(f"🔧 Loaded configuration: {args.config}")
+            if overrides:
+                logger.info(f"Applied overrides: {overrides}")
+        except Exception as e:
+            logger.error(f"Failed to load configuration: {e}")
+            logger.info("Falling back to CLI arguments")
+            config = None
+    elif args.config:
+        logger.warning("Config system not available (missing config_loader). Using CLI arguments.")
+    
+    # Auto-detect and apply A100 optimizations if using config system
+    if config:
+        config = detect_and_apply_a100_optimizations(config)
+        optimize_gpu_settings(config)
+        
+        # Override CLI arguments with config values
+        args.network = config.get('model.network', args.network)
+        args.num_features = config.get('model.num_features', args.num_features)
+        args.target = config.get('data.target', args.target)
+        args.batch_size = config.get('data.batch_size', args.batch_size)
+        args.num_workers = config.get('data.num_workers', args.num_workers)
+        args.use_flip_test = config.get('evaluation.use_flip_test', args.use_flip_test)
+        args.use_norm_score = config.get('evaluation.use_norm_score', args.use_norm_score)
+        args.use_detector_score = config.get('evaluation.use_detector_score', args.use_detector_score)
+        args.result_dir = config.get('output.result_dir', args.result_dir)
+        args.job = config.get('output.job', args.job)
+        args.wandb_project = config.get('wandb.project', args.wandb_project)
+        args.wandb_entity = config.get('wandb.entity', args.wandb_entity)
+    
     # Handle model path with MODEL_ROOT support
     if args.model_path is None:
         parser.error("--model-path is required")
@@ -425,13 +654,19 @@ def main():
     logger.info(f"Network: {args.network}")
     logger.info(f"Dataset: {args.target}")
     logger.info(f"Device: {device}")
+    if config:
+        logger.info(f"Config: {args.config}")
+        logger.info(f"Mixed Precision: {config.get('performance.mixed_precision', False)}")
+        logger.info(f"Batch Size: {args.batch_size}")
     logger.info("="*80)
     
     # Initialize W&B
-    wandb_enabled = setup_wandb(args)
+    wandb_enabled = setup_wandb(args, config)
     
     # Initialize performance monitoring
+    monitor_interval = config.get('monitoring.memory_monitor_interval', 1.0) if config else 1.0
     monitor = PerformanceMonitor(logger=logger)
+    monitor.monitor_interval = monitor_interval
     monitor.start()
     
     # Initialize metrics calculator
@@ -439,7 +674,7 @@ def main():
     
     try:
         # Load model
-        model = load_model(args.model_path, args.network, args.num_features)
+        model = load_model(args.model_path, args.network, args.num_features, config)
         
         # Load IJB-C metadata - detect format (HuggingFace vs traditional)
         logger.info("Loading IJB-C metadata...")
@@ -457,7 +692,8 @@ def main():
             hf_dataset = load_hf_dataset_images(args.image_path)
             
             # Create HuggingFace dataset
-            dataset = HFIJBCDataset(hf_dataset, faceness_scores)
+            channels_last = config.get('evaluation.channels_last', False) if config else False
+            dataset = HFIJBCDataset(hf_dataset, faceness_scores, channels_last=channels_last)
             
         elif os.path.exists(meta_dir):
             # Traditional IJB-C format
@@ -490,15 +726,25 @@ def main():
         logger.info(f"Loaded {len(templates)} images, {len(np.unique(templates))} templates")
         logger.info(f"Loaded {len(p1)} verification pairs")
         
-        dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True
-        )
+        # Create optimized dataloader
+        dataloader_kwargs = {
+            'batch_size': args.batch_size,
+            'shuffle': False,
+            'num_workers': args.num_workers,
+            'pin_memory': True
+        }
+        
+        # Add optimization parameters if config available
+        if config:
+            dataloader_kwargs.update({
+                'prefetch_factor': config.get('data.prefetch_factor', 2),
+                'persistent_workers': config.get('data.persistent_workers', True)
+            })
+        
+        dataloader = DataLoader(dataset, **dataloader_kwargs)
         
         logger.info(f"Created dataset with {len(dataset)} images")
+        logger.info(f"DataLoader: batch_size={dataloader.batch_size}, num_workers={dataloader.num_workers}")
         
         # Extract features
         eval_start_time = time.time()
@@ -506,10 +752,17 @@ def main():
             model, dataloader, 
             use_flip_test=args.use_flip_test,
             use_norm_score=args.use_norm_score,
-            use_detector_score=args.use_detector_score
+            use_detector_score=args.use_detector_score,
+            config=config
         )
         
         feature_extraction_time = time.time() - eval_start_time
+        
+        # Clear model from memory if requested
+        if config and config.get('performance.clear_cache_between_models', False):
+            del model
+            torch.cuda.empty_cache()
+            gc.collect()
         
         # Aggregate features into templates
         logger.info("Aggregating template features...")
@@ -543,6 +796,10 @@ def main():
             'num_features': args.num_features,
             'target': args.target,
             
+            # Config info
+            'config_name': args.config if args.config else 'CLI',
+            'optimization_level': 'A100' if (config and config.get('performance.mixed_precision')) else 'Standard',
+            
             # Verification metrics
             **{f'verification_{k}': v for k, v in verification_metrics.items()},
             
@@ -566,6 +823,11 @@ def main():
             'use_detector_score': args.use_detector_score,
             'batch_size': args.batch_size,
             
+            # Optimization settings
+            'mixed_precision': config.get('performance.mixed_precision', False) if config else False,
+            'channels_last': config.get('evaluation.channels_last', False) if config else False,
+            'compiled_model': config.get('evaluation.compile_model', False) if config else False,
+            
             # Timestamps
             'evaluation_timestamp': datetime.now().isoformat(),
             'feature_extraction_time_seconds': feature_extraction_time,
@@ -584,6 +846,8 @@ def main():
         logger.info("📊 COMPREHENSIVE EVALUATION SUMMARY")
         logger.info("="*80)
         logger.info(f"🎯 Model: {args.network}")
+        logger.info(f"🔧 Config: {args.config if args.config else 'CLI'}")
+        logger.info(f"⚡ Optimization: {comprehensive_results['optimization_level']}")
         logger.info(f"📊 {args.target} TPR@FPR=1e-4: {verification_metrics['tpr_at_fpr_1e-4']:.2f}%")
         logger.info(f"📈 ROC AUC: {verification_metrics['roc_auc']:.4f}")
         logger.info(f"⚖️  EER: {verification_metrics['eer']:.2f}%")
@@ -594,6 +858,11 @@ def main():
         logger.info(f"🧠 RAM Peak: {resource_metrics['ram_peak_mb']:.1f} MB")
         logger.info(f"⏱️  Total Time: {resource_metrics['total_duration_minutes']:.1f} min")
         logger.info(f"📦 Model Size: {model_size_metrics['model_size_mb']:.1f} MB")
+        logger.info(f"🔧 Batch Size: {args.batch_size}")
+        if config:
+            logger.info(f"🎛️  Mixed Precision: {'✅' if config.get('performance.mixed_precision') else '❌'}")
+            logger.info(f"🎛️  Channels Last: {'✅' if config.get('evaluation.channels_last') else '❌'}")
+            logger.info(f"🎛️  Model Compiled: {'✅' if config.get('evaluation.compile_model') else '❌'}")
         logger.info("="*80)
         
         logger.info(f"✅ Evaluation completed successfully!")

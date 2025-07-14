@@ -1,0 +1,76 @@
+# Batch Evaluation Configuration for Multiple Models on A100
+# Optimized for evaluating multiple ArcFace models efficiently
+
+# Models to evaluate (can override individual settings)
+models:
+  - name: "r18_ms1mv3"
+    network: "r18"
+    model_path: "./pretrained_models/ms1mv3_arcface_r18_fp16/backbone.pth"
+    batch_size: 512  # Higher batch size for smaller model
+  - name: "r34_ms1mv3" 
+    network: "r34"
+    model_path: "./pretrained_models/ms1mv3_arcface_r34_fp16/backbone.pth"
+    batch_size: 384
+  - name: "r50_ms1mv3"
+    network: "r50" 
+    model_path: "./pretrained_models/ms1mv3_arcface_r50_fp16/backbone.pth"
+    batch_size: 256
+  - name: "r100_ms1mv3"
+    network: "r100"
+    model_path: "./pretrained_models/ms1mv3_arcface_r100_fp16/backbone.pth"
+    batch_size: 256  # Conservative for largest model
+
+# Global Configuration (inherited by all models)
+global:
+  # Model Configuration
+  model:
+    num_features: 512
+    fp16: true
+    
+  # Data Configuration  
+  data:
+    target: "IJBC"
+    num_workers: 16
+    pin_memory: true
+    prefetch_factor: 4
+    persistent_workers: true
+    
+  # Evaluation Configuration
+  evaluation:
+    use_flip_test: true
+    use_norm_score: true  
+    use_detector_score: true
+    compile_model: true
+    channels_last: true
+    
+  # Performance Optimization
+  performance:
+    mixed_precision: true
+    compile_mode: "max-autotune"
+    enable_graph_mode: true
+    matmul_precision: "high"
+    cuda_memory_fraction: 0.95
+    clear_cache_between_models: true  # Clear GPU cache between models
+    
+  # Monitoring Configuration
+  monitoring:
+    memory_monitor_interval: 2.0
+    log_interval: 50
+    
+  # Output Configuration
+  output:
+    result_dir: "./eval_results/batch_evaluation"
+    job_prefix: "batch_a100"
+    save_features: false
+    
+  # W&B Configuration
+  wandb:
+    project: "arcface-batch-a100-benchmark"
+    entity: null
+    tags: ["batch", "a100", "optimized"]
+
+# Parallel evaluation settings
+parallel:
+  max_concurrent_models: 1  # Evaluate models sequentially on single GPU
+  gpu_memory_threshold: 0.9  # Stop if GPU memory exceeds this
+  cleanup_between_models: true
