@@ -324,7 +324,7 @@ def extract_features(model, dataloader, use_flip_test=True, use_norm_score=True,
         log_interval = 100
         clear_cache_interval = 50
     
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     
     model.eval()
     with torch.no_grad():
