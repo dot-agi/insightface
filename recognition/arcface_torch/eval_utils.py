@@ -655,25 +655,40 @@ def plot_to_wandb_image(figure, name="plot"):
 
 
 def log_results_to_wandb(results_dict, prefix=""):
-    """Log evaluation results to Weights & Biases with enhanced visualizations"""
+    """Log evaluation results to Weights & Biases with enhanced visualizations, filtering out non-plotted metrics"""
     if not WANDB_AVAILABLE:
         print("Warning: wandb not available, skipping W&B logging")
         return
         
     try:
-        # Filter out non-numeric values for W&B
+        # Define metrics that should NOT be plotted (single values, metadata)
+        non_plotted_metrics = {
+            'model_path', 'network', 'num_features', 'target', 'config_name', 'optimization_level',
+            'total_images', 'total_templates', 'verification_pairs', 'use_flip_test', 'use_norm_score', 
+            'use_detector_score', 'batch_size', 'mixed_precision', 'channels_last', 'compiled_model',
+            'evaluation_timestamp', 'feature_extraction_time_seconds', 'model_model_size_mb',
+            'model_model_size_gb', 'num_features'
+        }
+        
+        # Filter results to only include metrics that should be plotted
         wandb_dict = {}
+        metadata_dict = {}
         curve_data = None
         
         for key, value in results_dict.items():
             if key == 'verification_curve_data':
                 curve_data = value
                 continue
+            elif key in non_plotted_metrics or isinstance(value, str):
+                # Store as metadata only (no plot)
+                metadata_dict[f"{prefix}{key}"] = value
             elif isinstance(value, (int, float, bool)):
+                # Include in main logging (will be plotted if appropriate)
                 wandb_dict[f"{prefix}{key}"] = value
-            elif isinstance(value, str):
-                # Log strings as text
-                wandb_dict[f"{prefix}{key}"] = value
+        
+        # Log metadata separately (W&B won't plot these)
+        if metadata_dict:
+            wandb.config.update(metadata_dict)
         
         # Create and log visualizations if curve data is available
         if curve_data:
@@ -720,25 +735,33 @@ def log_results_to_wandb(results_dict, prefix=""):
         
         # Log all metrics
         wandb.log(wandb_dict)
-        print(f"Logged {len(wandb_dict)} metrics and visualizations to W&B")
+        print(f"Logged {len(wandb_dict)} metrics and visualizations to W&B ({len(metadata_dict)} metadata items)")
         
     except Exception as e:
         print(f"Error logging to W&B: {e}")
 
 
 def log_progress_to_wandb(step, metrics_dict, prefix="progress"):
-    """Log time series data to W&B for chart visualization"""
+    """Log time series data to W&B for chart visualization with filtered metrics"""
     if not WANDB_AVAILABLE:
         return
         
     try:
-        # Prepare metrics with step information
-        wandb_dict = {"step": step}
+        # Filter metrics that should be plotted as time series
+        time_series_metrics = {}
+        
         for key, value in metrics_dict.items():
-            if isinstance(value, (int, float, bool)):
-                wandb_dict[f"{prefix}/{key}"] = value
+            # Only log metrics that change over time and are meaningful to plot
+            if key in ['images_processed', 'current_fps', 'elapsed_time_seconds', 
+                      'progress_percent', 'current_ram_mb', 'current_gpu_mb', 'current_cpu_percent']:
+                if isinstance(value, (int, float, bool)):
+                    time_series_metrics[f"{prefix}/{key}"] = value
                 
-        wandb.log(wandb_dict, step=step)
+        # Add step information for time series
+        if time_series_metrics:
+            time_series_metrics["step"] = step
+            wandb.log(time_series_metrics, step=step)
+        
     except Exception as e:
         print(f"Error logging progress to W&B: {e}")
 
